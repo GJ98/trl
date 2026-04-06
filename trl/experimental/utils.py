@@ -160,13 +160,13 @@ class DataCollatorForChatML:
             if formatted_prompt is None:
                 prompt = example[self.messages_key][:-1]
                 formatted_prompt = self.tokenizer.apply_chat_template(
-                    prompt, add_generation_prompt=True, tokenize=False
+                    prompt, add_generation_prompt=True, tokenize=False, enable_thinking=False
                 )
 
             if "input_ids" not in example:
                 message = example[self.messages_key]
                 formatted_message = self.tokenizer.apply_chat_template(
-                    message, add_generation_prompt=False, tokenize=False
+                    message, add_generation_prompt=False, tokenize=False, enable_thinking=False
                 )
 
                 tokenized_message = self.tokenizer(

@@ -239,13 +239,11 @@ def build_teacher_inputs_from_messages(
     prompt_lengths: list[int] = []
 
     for messages in messages_batch:
-        # Build full text and prompt both with add_generation_prompt=False to ensure
-        # prompt_text is an exact prefix of full_text. Using add_generation_prompt=True
-        # for the prompt causes a mismatch with Gemma 4's chat template, which inserts
-        # a thinking channel header (<|channel>thought\n<channel|>) only in the generation
-        # prompt suffix but not in the rendered assistant turn body.
-        full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        prompt_text = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=False)
+        # Build prompt from all messages except the last (assistant) turn
+        prompt_text = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        # Build full text from all messages
+        full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, enable_thinking=False)
+        # Extract completion as the suffix after the prompt
         completion_text = full_text[len(prompt_text):]
 
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
@@ -405,6 +403,10 @@ class ULDLoss(nn.Module):
         student_answer_index, student_answer_size = self._get_start_and_size_answers(student_labels)
         teacher_answer_index, teacher_answer_size = self._get_start_and_size_answers(teacher_labels)
 
+        # # DEBUG
+        # print(f"[DEBUG ULD] student_answer_index: {student_answer_index}, student_answer_size: {student_answer_size}")
+        # print(f"[DEBUG ULD] teacher_answer_index: {teacher_answer_index}, teacher_answer_size: {teacher_answer_size}")
+
         if self.skip_student_eos:
             student_answer_size = [size - 1 for size in student_answer_size]
         if self.skip_teacher_eos:
@@ -416,6 +418,7 @@ class ULDLoss(nn.Module):
             or not teacher_answer_size
             or max(max(student_answer_size), max(teacher_answer_size)) <= 0
         ):
+            # print("[DEBUG ULD] EARLY RETURN: all answer sizes are 0!")
             return torch.zeros(1, device=student_logits.device, requires_grad=True) * student_logits.sum() * 1e-8
 
         batch_size = student_logits.size(0)
@@ -450,6 +453,21 @@ class ULDLoss(nn.Module):
                 student_alignment_groups, teacher_alignment_groups = self._build_alignment_groups_from_ids(
                     student_token_ids, teacher_token_ids
                 )
+
+                # # DEBUG
+                # print(f"[DEBUG align] num_student_groups: {len(student_alignment_groups)}, num_teacher_groups: {len(teacher_alignment_groups)}")
+                # def _dbg_pieces(tok, ids):
+                #     pieces = []
+                #     prev = ""
+                #     for k in range(min(len(ids), 10)):
+                #         cur = tok.decode(ids[:k+1], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                #         pieces.append(cur[len(prev):])
+                #         prev = cur
+                #     return pieces
+                # s_pcs = _dbg_pieces(self.student_tokenizer, student_token_ids)
+                # t_pcs = _dbg_pieces(self.teacher_tokenizer, teacher_token_ids)
+                # print(f"[DEBUG align] student first 10 pieces: {s_pcs}")
+                # print(f"[DEBUG align] teacher first 10 pieces: {t_pcs}")
 
                 # Merge student probabilities using student alignment groups
                 # Pass student_token_ids to enable corrected conditional probability merging
@@ -709,11 +727,20 @@ class ULDLoss(nn.Module):
             student_matched_probs = student_aligned[:, student_matched_indices]  # [seq_len, num_matched]
             matched_token_count = teacher_matched_probs.size(-1)
 
-            # Use JSD loss for semantically aligned tokens
-            # Convert probabilities back to logits for JSD computation
+            # # DEBUG
+            # print(f"[DEBUG hybrid] student_aligned shape: {student_aligned.shape}, dtype: {student_aligned.dtype}")
+            # print(f"[DEBUG hybrid] teacher_aligned shape: {teacher_aligned.shape}, dtype: {teacher_aligned.dtype}")
+            # print(f"[DEBUG hybrid] matched_token_count: {matched_token_count}")
+            # print(f"[DEBUG hybrid] student_matched_probs sum(dim=-1) first 3: {student_matched_probs.sum(dim=-1)[:3].tolist()}")
+            # print(f"[DEBUG hybrid] teacher_matched_probs sum(dim=-1) first 3: {teacher_matched_probs.sum(dim=-1)[:3].tolist()}")
+            # print(f"[DEBUG hybrid] student_matched_probs max: {student_matched_probs.max().item():.8f}, mean: {student_matched_probs.mean().item():.8f}")
+            # print(f"[DEBUG hybrid] teacher_matched_probs max: {teacher_matched_probs.max().item():.8f}, mean: {teacher_matched_probs.mean().item():.8f}")
+            # print(f"[DEBUG hybrid] student_matched_probs nonzero: {(student_matched_probs > 0).sum().item()}")
+            # print(f"[DEBUG hybrid] teacher_matched_probs nonzero: {(teacher_matched_probs > 0).sum().item()}")
 
             # Apply generalized JSD loss to matched tokens
             matched_loss = self._compute_jsd_loss_for_matched_tokens(student_matched_probs, teacher_matched_probs)
+            # print(f"[DEBUG hybrid] matched_loss after JSD: {matched_loss.item():.10f}")
 
         # 2. Sorted comparison loss for unmatched vocabulary tokens
         unmatched_loss = torch.tensor(0.0, device=device)
@@ -1475,11 +1502,12 @@ class GOLDTrainer(SFTTrainer):
                 if "prompt" in example:  # prompt-completion case
                     if is_conversational(example):
                         prompt_ids = processing_class.apply_chat_template(
-                            example["prompt"], return_dict=False, **example.get("chat_template_kwargs", {})
+                            example["prompt"], return_dict=False, enable_thinking=False, **example.get("chat_template_kwargs", {})
                         )
                         prompt_completion_ids = processing_class.apply_chat_template(
                             example["prompt"] + example["completion"],
                             return_dict=False,
+                            enable_thinking=False,
                             **example.get("chat_template_kwargs", {}),
                         )
                     else:
@@ -1522,6 +1550,7 @@ class GOLDTrainer(SFTTrainer):
                                 user_messages,
                                 add_generation_prompt=True,  # add assistant prompt
                                 tokenize=False,
+                                enable_thinking=False,
                                 **example.get("chat_template_kwargs", {}),
                             )
 
@@ -1530,6 +1559,7 @@ class GOLDTrainer(SFTTrainer):
                                 messages,
                                 add_generation_prompt=False,
                                 tokenize=False,
+                                enable_thinking=False,
                                 **example.get("chat_template_kwargs", {}),
                             )
 
@@ -1549,13 +1579,14 @@ class GOLDTrainer(SFTTrainer):
                         else:
                             # Fallback: use empty prompt and full text as completion
                             full_text = processing_class.apply_chat_template(
-                                messages, tokenize=False, **example.get("chat_template_kwargs", {})
+                                messages, tokenize=False, enable_thinking=False, **example.get("chat_template_kwargs", {})
                             )
                         # Process the conversation normally
                         processed = processing_class.apply_chat_template(
                             example["messages"],
                             return_dict=True,
                             return_assistant_tokens_mask=assistant_only_loss,
+                            enable_thinking=False,
                             **example.get("chat_template_kwargs", {}),
                         )
                         if "assistant_masks" in processed and 1 not in processed["assistant_masks"]:
@@ -1860,6 +1891,15 @@ class GOLDTrainer(SFTTrainer):
             ):
                 teacher_labels[teacher_labels == self.teacher_tokenizer.pad_token_id] = -100
 
+            # # DEBUG: trace zero-loss issue
+            # if self.accelerator.is_main_process and self._step < 3:
+            #     print(f"[DEBUG step={self._step}] student_logits shape: {outputs_student.logits.shape}")
+            #     print(f"[DEBUG step={self._step}] teacher_logits shape: {outputs_teacher.logits.shape}")
+            #     print(f"[DEBUG step={self._step}] student_labels non-masked: {(student_labels != -100).sum().item()}")
+            #     print(f"[DEBUG step={self._step}] teacher_labels non-masked: {(teacher_labels_for_loss != -100).sum().item()}")
+            #     print(f"[DEBUG step={self._step}] student_logits abs mean: {outputs_student.logits.abs().mean().item():.6f}")
+            #     print(f"[DEBUG step={self._step}] teacher_logits abs mean: {outputs_teacher.logits.abs().mean().item():.6f}")
+
             loss = self.uld_loss_fn(
                 student_logits=outputs_student.logits,
                 teacher_logits=outputs_teacher.logits,
@@ -1868,6 +1908,15 @@ class GOLDTrainer(SFTTrainer):
                 student_input_ids=student_input_ids,
                 teacher_input_ids=teacher_input_ids_for_loss,
             )
+
+            # # DEBUG: trace loss value
+            # if self.accelerator.is_main_process and self._step < 3:
+            #     print(f"[DEBUG step={self._step}] loss: {loss.item():.8f}")
+            #     if hasattr(self.uld_loss_fn, 'last_matched_loss'):
+            #         ml = self.uld_loss_fn.last_matched_loss
+            #         ul = self.uld_loss_fn.last_unmatched_loss
+            #         print(f"[DEBUG step={self._step}] matched_loss: {ml.item() if ml is not None else 'None':.8f}")
+            #         print(f"[DEBUG step={self._step}] unmatched_loss: {ul.item() if ul is not None else 'None':.8f}")
 
             if hasattr(self.uld_loss_fn, "last_matched_loss") and hasattr(self.uld_loss_fn, "last_unmatched_loss"):
                 ga = max(1, int(self.args.gradient_accumulation_steps))
