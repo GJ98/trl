@@ -239,11 +239,13 @@ def build_teacher_inputs_from_messages(
     prompt_lengths: list[int] = []
 
     for messages in messages_batch:
-        # Build prompt from all messages except the last (assistant) turn
-        prompt_text = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
-        # Build full text from all messages
+        # Build full text and prompt both with add_generation_prompt=False to ensure
+        # prompt_text is an exact prefix of full_text. Using add_generation_prompt=True
+        # for the prompt causes a mismatch with Gemma 4's chat template, which inserts
+        # a thinking channel header (<|channel>thought\n<channel|>) only in the generation
+        # prompt suffix but not in the rendered assistant turn body.
         full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        # Extract completion as the suffix after the prompt
+        prompt_text = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=False)
         completion_text = full_text[len(prompt_text):]
 
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
