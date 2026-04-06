@@ -1,0 +1,32 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+
+deepspeed_config:
+  deepspeed_config_file: ds_zero3.json
+  zero3_init_flag: true
+
+distributed_type: DEEPSPEED
+
+# Mixed precision - BF16 for better stability with large models
+downcast_bf16: 'no'
+mixed_precision: null
+
+# Single-node setup
+machine_rank: 0
+num_machines: 1
+
+# 4 GPU configuration
+num_processes: 4
+
+# Communication backend
+rdzv_backend: static
+same_network: true
+
+# Not using TPU
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+
+# Main function name (used by accelerate)
+main_training_function: train
