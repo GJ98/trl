@@ -152,8 +152,10 @@ class DataCollatorForChatML:
         prompts_input_ids = []
         prompt_attention_mask = []
         labels = []
+        messages = []
 
         for example in examples:
+            messages.append(example[self.messages_key])
             formatted_prompt = example.get(self.prompt_key, None)
             if formatted_prompt is None:
                 prompt = example[self.messages_key][:-1]
@@ -258,6 +260,7 @@ class DataCollatorForChatML:
             "labels": labels,
             "prompts": prompts_input_ids,
             "prompt_attention_mask": prompt_attention_mask,
+            "messages": messages,
         }
 
 

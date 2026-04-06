@@ -20,7 +20,12 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from trl.experimental.gold import gold_trainer as gold_trainer_module
-from trl.experimental.gold.gold_trainer import GOLDTrainer, ULDLoss, build_teacher_inputs_from_texts
+from trl.experimental.gold.gold_trainer import (
+    GOLDTrainer,
+    ULDLoss,
+    build_teacher_inputs_from_messages,
+    build_teacher_inputs_from_texts,
+)
 from trl.experimental.utils import DataCollatorForChatML
 
 
@@ -476,8 +481,6 @@ def test_generate_on_policy_for_slices_reconstructs_prompt_with_special_tokens()
     assert torch.equal(buffered_inputs["input_ids"], torch.tensor([[5, 13, 6, 42]], dtype=torch.long))
     assert torch.equal(buffered_inputs["attention_mask"], torch.tensor([[1, 1, 1, 1]], dtype=torch.long))
     assert torch.equal(buffered_inputs["labels"], torch.tensor([[-100, -100, -100, 42]], dtype=torch.long))
-    assert buffered_inputs["original_prompt_text"] == ["A <special> B"]
-    assert buffered_inputs["original_completion_text"] == ["C"]
     assert trainer._buffered_text_logs[0] == (["A B"], ["C"])
 
 
@@ -625,7 +628,8 @@ def test_merge_probabilities_multiplies_split_tokens():
     torch.testing.assert_close(merged[0], expected)
 
 
-def test_initialize_vocabulary_mapping_contains_common_tokens(llama_tokenizer, qwen_tokenizer):
+def test_initialize_vocabulary_mapping_requires_identical_id(llama_tokenizer, qwen_tokenizer):
+    """Vocab mapping only matches tokens where both string AND ID are identical."""
     config = build_config(
         uld_use_hybrid_loss=True,
         uld_hybrid_matched_weight=1.0,
@@ -633,16 +637,29 @@ def test_initialize_vocabulary_mapping_contains_common_tokens(llama_tokenizer, q
     )
     loss = ULDLoss(config, student_tokenizer=llama_tokenizer, teacher_tokenizer=qwen_tokenizer)
 
-    common_tokens = ["Hello", "world", "-", "ol", "LM", "3", "B"]
-    for token in common_tokens:
-        student_id = llama_tokenizer.convert_tokens_to_ids(token)
-        teacher_id = qwen_tokenizer.convert_tokens_to_ids(token)
-        assert student_id is not None
-        assert teacher_id is not None
-        assert teacher_id in loss._vocab_mapping
-        assert loss._vocab_mapping[teacher_id] == student_id
-        assert teacher_id in loss._teacher_matched_ids
-        assert student_id in loss._student_matched_ids
+    student_vocab = llama_tokenizer.get_vocab()
+    teacher_vocab = qwen_tokenizer.get_vocab()
+
+    # Every matched token must have identical string AND identical ID
+    for teacher_id, student_id in loss._vocab_mapping.items():
+        assert teacher_id == student_id, "Matched tokens must have identical IDs"
+
+    # Tokens with same string but different IDs must NOT be matched
+    for token_str, teacher_id in teacher_vocab.items():
+        if token_str in student_vocab:
+            student_id = student_vocab[token_str]
+            if teacher_id != student_id:
+                assert teacher_id not in loss._vocab_mapping, (
+                    f"Token '{token_str}' has different IDs (teacher={teacher_id}, student={student_id}) "
+                    "but was matched"
+                )
+
+    # mapping_tensor should have -1 for tokens not in vocab_mapping
+    for idx in range(loss.mapping_tensor.size(0)):
+        if idx in loss._vocab_mapping:
+            assert loss.mapping_tensor[idx].item() == idx  # ID-identical means mapping[id] == id
+        else:
+            assert loss.mapping_tensor[idx].item() == -1
 
 
 def test_get_start_and_size_answers_skips_prompt_tokens():
@@ -723,7 +740,7 @@ def test_generate_on_policy_outputs_masks_prompt_smollm(smollm_tokenizer, openr1
 
     collator = DataCollatorForChatML(tokenizer=smollm_tokenizer)
     batch = collator([openr1_examples[0]])
-    batch = {k: v.cpu() for k, v in batch.items()}
+    batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     class DummyModel:
         def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
@@ -942,3 +959,314 @@ def test_uldloss_hybrid_config_beta_zero(llama_tokenizer, qwen_tokenizer):
 
     expected = config.uld_hybrid_unmatched_weight * loss_fn.last_unmatched_loss
     torch.testing.assert_close(loss, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_uldloss_skips_unmatched_when_weight_zero(llama_tokenizer, qwen_tokenizer):
+    """When uld_hybrid_unmatched_weight=0.0, unmatched loss must be 0 and total_loss equals matched_weight * matched_loss."""
+    config = build_config(
+        uld_use_hybrid_loss=True,
+        uld_hybrid_matched_weight=1.0,
+        uld_hybrid_unmatched_weight=0.0,
+    )
+    loss_fn = ULDLoss(config, student_tokenizer=llama_tokenizer, teacher_tokenizer=qwen_tokenizer)
+
+    prompt = "User: What is distillation?"
+    completion = "Assistant: Distillation transfers knowledge from a large model to a small one."
+
+    student_ids, student_labels = encode_prompt_completion(llama_tokenizer, prompt, completion)
+    teacher_ids, teacher_labels = encode_prompt_completion(qwen_tokenizer, prompt, completion)
+
+    pad_id_student = llama_tokenizer.pad_token_id
+    pad_id_teacher = qwen_tokenizer.pad_token_id
+    max_length = max(len(student_ids), len(teacher_ids))
+
+    student_ids = pad_tokens(student_ids, pad_id_student, max_length)
+    teacher_ids = pad_tokens(teacher_ids, pad_id_teacher, max_length)
+    student_labels = pad_labels(student_labels, max_length)
+    teacher_labels = pad_labels(teacher_labels, max_length)
+
+    student_input_ids = torch.tensor([student_ids])
+    teacher_input_ids = torch.tensor([teacher_ids])
+    student_labels = torch.tensor([student_labels])
+    teacher_labels = torch.tensor([teacher_labels])
+
+    student_vocab = len(llama_tokenizer)
+    teacher_vocab = len(qwen_tokenizer)
+    torch.manual_seed(42)
+    student_logits = torch.randn(1, max_length, student_vocab)
+    teacher_logits = torch.randn(1, max_length, teacher_vocab)
+
+    loss = loss_fn(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        student_labels=student_labels,
+        teacher_labels=teacher_labels,
+        student_input_ids=student_input_ids,
+        teacher_input_ids=teacher_input_ids,
+    )
+
+    assert torch.isfinite(loss)
+    assert loss.dim() == 0
+    # Unmatched loss must be exactly 0 (skipped computation)
+    assert loss_fn.last_unmatched_loss.item() == 0.0
+    # Total loss = matched_weight * matched_loss + 0
+    expected = config.uld_hybrid_matched_weight * loss_fn.last_matched_loss
+    torch.testing.assert_close(loss, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_chatml_collator_returns_messages():
+    """DataCollatorForChatML must include raw messages in its output."""
+    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM3-3B")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    collator = DataCollatorForChatML(tokenizer=tokenizer, max_length=128)
+
+    examples = [
+        {"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]},
+        {"messages": [{"role": "user", "content": "Bye"}, {"role": "assistant", "content": "See ya"}]},
+    ]
+    batch = collator(examples)
+
+    assert "messages" in batch
+    assert len(batch["messages"]) == 2
+    assert batch["messages"][0] == examples[0]["messages"]
+    assert batch["messages"][1] == examples[1]["messages"]
+
+
+def test_split_tensor_dict_handles_list_values():
+    """split_tensor_dict must split list values alongside tensors."""
+    from trl.trainer.utils import split_tensor_dict
+
+    tensor_dict = {
+        "input_ids": torch.arange(12).reshape(4, 3),
+        "messages": [
+            [{"role": "user", "content": "a"}],
+            [{"role": "user", "content": "b"}],
+            [{"role": "user", "content": "c"}],
+            [{"role": "user", "content": "d"}],
+        ],
+        "optional": None,
+    }
+    chunks = split_tensor_dict(tensor_dict, 2)
+
+    assert len(chunks) == 2
+    assert torch.equal(chunks[0]["input_ids"], torch.arange(6).reshape(2, 3))
+    assert chunks[0]["messages"] == tensor_dict["messages"][:2]
+    assert chunks[1]["messages"] == tensor_dict["messages"][2:]
+    assert chunks[0]["optional"] is None
+
+
+def test_generate_non_vllm_updates_messages_with_completion():
+    """_generate_non_vllm_for_slices should copy messages and set last element to generated completion."""
+
+    trainer = GOLDTrainer.__new__(GOLDTrainer)
+    trainer._buffered_inputs = [None]
+    trainer._buffered_text_logs = [None]
+
+    original_messages = [
+        [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "original"}],
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "original2"}],
+    ]
+
+    class FakeResult:
+        pass
+
+    def fake_generate(model, inputs, gen_config, pad_token_id):
+        return (
+            torch.tensor([[1, 2, 3], [4, 5, 6]]),  # input_ids
+            torch.ones(2, 3, dtype=torch.long),  # attention_mask
+            torch.tensor([[-100, 2, 3], [-100, 5, 6]]),  # labels
+            ["prompt1", "prompt2"],  # prompt_texts
+            ["generated1", "generated2"],  # completion_texts
+        )
+
+    trainer.generate_on_policy_outputs = fake_generate
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_unwrap(*args, **kwargs):
+        yield None
+
+    import trl.experimental.gold.gold_trainer as module
+
+    original_unwrap = module.unwrap_model_for_generation
+    module.unwrap_model_for_generation = fake_unwrap
+    try:
+        trainer.model = None
+        trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+        trainer.generation_config = None
+        trainer.processing_class = SimpleNamespace(pad_token_id=0)
+        trainer.generation_kwargs = {}
+
+        slices = [{"input_ids": torch.tensor([[1, 2]]), "messages": original_messages}]
+        GOLDTrainer._generate_non_vllm_for_slices(trainer, slices, [0])
+    finally:
+        module.unwrap_model_for_generation = original_unwrap
+
+    updated = trainer._buffered_inputs[0]
+    assert updated["messages"][0][-1] == {"role": "assistant", "content": "generated1"}
+    assert updated["messages"][1][-1] == {"role": "assistant", "content": "generated2"}
+    # Original messages should be unmodified
+    assert original_messages[0][-1] == {"role": "assistant", "content": "original"}
+    assert original_messages[1][-1] == {"role": "assistant", "content": "original2"}
+
+
+def test_process_completions_to_buffer_updates_messages():
+    """_process_completions_to_buffer should copy messages and set last element to generated completion."""
+
+    class RecordingTokenizer:
+        pad_token_id = 0
+        pad_token = "<pad>"
+
+        def batch_decode(self, sequences, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+            del skip_special_tokens, clean_up_tokenization_spaces
+            return [" ".join(str(token) for token in sequence) for sequence in sequences]
+
+    trainer = GOLDTrainer.__new__(GOLDTrainer)
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+    trainer.processing_class = RecordingTokenizer()
+    trainer.args = SimpleNamespace(max_length=None)
+    trainer._buffered_inputs = [None]
+    trainer._buffered_text_logs = [None]
+
+    original_messages = [
+        [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "original1"}],
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "original2"}],
+    ]
+
+    GOLDTrainer._process_completions_to_buffer(
+        trainer,
+        slices=[{"slice": "original", "messages": original_messages}],
+        on_policy_indices=[0],
+        local_slice_indices=[0, 0],
+        completion_ids=[[31], [41]],
+        prompts_text_with_special=["short", "longer"],
+        prompt_ids_list=[[11], [21, 22]],
+        prompts_text=["short", "longer"],
+        max_completion_length=1,
+    )
+
+    updated = trainer._buffered_inputs[0]
+    # completion_texts are decoded from completion_ids: "31" and "41"
+    assert updated["messages"][0][-1] == {"role": "assistant", "content": "31"}
+    assert updated["messages"][1][-1] == {"role": "assistant", "content": "41"}
+    # Original messages should be unmodified
+    assert original_messages[0][-1] == {"role": "assistant", "content": "original1"}
+    assert original_messages[1][-1] == {"role": "assistant", "content": "original2"}
+
+
+@pytest.mark.slow
+def test_build_teacher_inputs_from_messages(qwen_tokenizer):
+    """build_teacher_inputs_from_messages uses the tokenizer's chat template to build teacher inputs."""
+    messages_batch = [
+        [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+        ],
+        [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+        ],
+    ]
+
+    teacher_input_ids, teacher_labels, teacher_attention_mask, teacher_prompt_length = (
+        build_teacher_inputs_from_messages(qwen_tokenizer, messages_batch)
+    )
+
+    batch_size = len(messages_batch)
+    assert teacher_input_ids.shape[0] == batch_size
+    assert teacher_labels.shape[0] == batch_size
+    assert teacher_attention_mask.shape[0] == batch_size
+    assert teacher_prompt_length > 0
+
+    # Each item should have masked prompt tokens and non-masked completion tokens
+    for i in range(batch_size):
+        assert (teacher_labels[i] == -100).any(), "Should have masked prompt tokens"
+        assert (teacher_labels[i] != -100).any(), "Should have non-masked completion tokens"
+        # First token should always be masked (part of prompt)
+        assert teacher_labels[i, 0] == -100
+
+    # Decoded completion should contain the assistant content
+    for i, messages in enumerate(messages_batch):
+        completion_mask = teacher_labels[i] != -100
+        completion_ids = teacher_input_ids[i][completion_mask].tolist()
+        decoded = qwen_tokenizer.decode(completion_ids, skip_special_tokens=True)
+        assert messages[-1]["content"] in decoded
+
+
+@pytest.mark.slow
+def test_build_teacher_inputs_from_messages_matches_texts(qwen_tokenizer):
+    """build_teacher_inputs_from_messages should produce similar results to build_teacher_inputs_from_texts."""
+    messages_batch = [
+        [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "The answer is 4."},
+        ],
+    ]
+
+    # Get results from messages-based function
+    msg_input_ids, msg_labels, msg_attn, msg_prompt_len = build_teacher_inputs_from_messages(
+        qwen_tokenizer, messages_batch
+    )
+
+    # Build equivalent text inputs using chat template
+    prompt_text = qwen_tokenizer.apply_chat_template(messages_batch[0][:-1], tokenize=False, add_generation_prompt=True)
+    full_text = qwen_tokenizer.apply_chat_template(messages_batch[0], tokenize=False, add_generation_prompt=False)
+    completion_text = full_text[len(prompt_text):]
+
+    txt_input_ids, txt_labels, txt_attn, txt_prompt_len = build_teacher_inputs_from_texts(
+        qwen_tokenizer, [prompt_text], [completion_text]
+    )
+
+    # Prompt lengths should match
+    assert msg_prompt_len == txt_prompt_len
+
+    # Input IDs should match
+    assert torch.equal(msg_input_ids, txt_input_ids)
+
+    # Labels should match
+    assert torch.equal(msg_labels, txt_labels)
+
+
+@pytest.mark.slow
+def test_compute_loss_uses_messages_path(llama_tokenizer, qwen_tokenizer, openr1_examples):
+    """When inputs contain 'messages', compute_loss should use build_teacher_inputs_from_messages."""
+    import unittest.mock as mock
+
+    collator = DataCollatorForChatML(tokenizer=llama_tokenizer, max_length=512)
+    batch = collator(openr1_examples)
+
+    # batch should already have 'messages' from collator
+    assert "messages" in batch
+
+    with mock.patch(
+        "trl.experimental.gold.gold_trainer.build_teacher_inputs_from_messages"
+    ) as mock_from_messages, mock.patch(
+        "trl.experimental.gold.gold_trainer.build_teacher_inputs_from_texts"
+    ) as mock_from_texts:
+        # Set up mock return for from_messages
+        seq_len = 10
+        batch_size = batch["input_ids"].shape[0]
+        mock_from_messages.return_value = (
+            torch.zeros(batch_size, seq_len, dtype=torch.long),
+            torch.full((batch_size, seq_len), -100, dtype=torch.long),
+            torch.ones(batch_size, seq_len, dtype=torch.bool),
+            5,
+        )
+
+        trainer = SimpleNamespace(
+            use_uld_loss=True,
+            teacher_tokenizer=qwen_tokenizer,
+            processing_class=llama_tokenizer,
+        )
+
+        # We can't run full compute_loss without a real model, but we can verify
+        # the dispatch logic by checking which function gets called
+        try:
+            GOLDTrainer.compute_loss(trainer, model=None, inputs=batch)
+        except Exception:
+            pass  # Expected to fail without real model
+
+        mock_from_messages.assert_called_once_with(qwen_tokenizer, batch["messages"])
+        mock_from_texts.assert_not_called()

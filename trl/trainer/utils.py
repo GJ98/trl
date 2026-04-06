@@ -847,18 +847,22 @@ def split_tensor_dict(
     ]
     ```
     """
-    first_tensor = next(tensor for tensor in tensor_dict.values() if tensor is not None)
+    first_tensor = next(
+        v for v in tensor_dict.values() if v is not None and isinstance(v, torch.Tensor)
+    )
     chunk_size = first_tensor.shape[0] // num_chunks
     chunks = []
     for i in range(num_chunks):
         chunk_dict = {}
-        for key, tensor in tensor_dict.items():
-            if tensor is not None and (isinstance(tensor, list) or tensor.ndim > 0):
-                chunk_dict[key] = tensor[i * chunk_size : (i + 1) * chunk_size]
-            elif tensor is not None and tensor.ndim == 0:
-                chunk_dict[key] = tensor
-            else:
+        for key, value in tensor_dict.items():
+            if value is None:
                 chunk_dict[key] = None
+            elif isinstance(value, list):
+                chunk_dict[key] = value[i * chunk_size : (i + 1) * chunk_size]
+            elif value.ndim > 0:
+                chunk_dict[key] = value[i * chunk_size : (i + 1) * chunk_size]
+            else:
+                chunk_dict[key] = value
         chunks.append(chunk_dict)
     return chunks
 

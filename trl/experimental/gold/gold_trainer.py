@@ -224,6 +224,71 @@ def build_teacher_inputs_from_texts(
     return teacher_input_ids, teacher_labels, teacher_attention_mask, teacher_prompt_length
 
 
+def build_teacher_inputs_from_messages(
+    tokenizer: PreTrainedTokenizerBase,
+    messages_batch: list[list[dict]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Build teacher model inputs by applying the teacher tokenizer's own chat template to raw messages."""
+
+    pad_token_id = tokenizer.pad_token_id
+    eos_token_id = tokenizer.eos_token_id
+
+    sequences: list[torch.Tensor] = []
+    attention_masks: list[torch.Tensor] = []
+    labels_list: list[torch.Tensor] = []
+    prompt_lengths: list[int] = []
+
+    for messages in messages_batch:
+        # Build prompt from all messages except the last (assistant) turn
+        prompt_text = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
+        # Build full text from all messages
+        full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        # Extract completion as the suffix after the prompt
+        completion_text = full_text[len(prompt_text):]
+
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        completion_ids = tokenizer(completion_text, add_special_tokens=False)["input_ids"]
+
+        prompt_lengths.append(len(prompt_ids))
+        sequence = list(prompt_ids)
+        sequence.extend(completion_ids)
+        if eos_token_id is not None and (not sequence or sequence[-1] != eos_token_id):
+            sequence.append(eos_token_id)
+
+        seq_tensor = torch.tensor(sequence, dtype=torch.long)
+        sequences.append(seq_tensor)
+        attention_masks.append(torch.ones_like(seq_tensor))
+
+        labels = seq_tensor.clone()
+        labels[: len(prompt_ids)] = -100
+        if pad_token_id is not None:
+            labels[labels == pad_token_id] = -100
+        labels_list.append(labels)
+
+    teacher_input_ids = pad(
+        sequences,
+        padding_side="right",
+        padding_value=pad_token_id if pad_token_id is not None else 0,
+    )
+    teacher_attention_mask = pad(attention_masks, padding_side="right", padding_value=0).bool()
+    teacher_labels = pad(labels_list, padding_side="right", padding_value=-100)
+
+    if eos_token_id is not None:
+        for row in range(teacher_attention_mask.size(0)):
+            valid = (
+                teacher_input_ids[row] != pad_token_id
+                if pad_token_id is not None
+                else teacher_attention_mask[row].bool()
+            )
+            if valid.any():
+                last_idx = valid.nonzero(as_tuple=True)[0][-1]
+                teacher_attention_mask[row, last_idx + 1 :] = False
+
+    teacher_prompt_length = max(prompt_lengths) if prompt_lengths else 0
+
+    return teacher_input_ids, teacher_labels, teacher_attention_mask, teacher_prompt_length
+
+
 class ULDLoss(nn.Module):
     """
     Universal Logit Distillation Loss.
@@ -309,9 +374,10 @@ class ULDLoss(nn.Module):
         for token_str, teacher_id in teacher_vocab.items():
             if token_str in student_token_to_id:
                 student_id = student_token_to_id[token_str]
-                vocab_mapping[teacher_id] = student_id
-                teacher_matched_ids.add(teacher_id)
-                student_matched_ids.add(student_id)
+                if teacher_id == student_id:
+                    vocab_mapping[teacher_id] = student_id
+                    teacher_matched_ids.add(teacher_id)
+                    student_matched_ids.add(student_id)
 
         self._vocab_mapping = vocab_mapping
         self._teacher_matched_ids = teacher_matched_ids
@@ -648,35 +714,38 @@ class ULDLoss(nn.Module):
             matched_loss = self._compute_jsd_loss_for_matched_tokens(student_matched_probs, teacher_matched_probs)
 
         # 2. Sorted comparison loss for unmatched vocabulary tokens
-        teacher_unmatched_mask = ~teacher_matched_mask
-        student_unmatched_mask = ~student_matched_mask
-
-        teacher_unmatched_probs = teacher_aligned[:, teacher_unmatched_mask]  # [seq_len, num_teacher_unmatched]
-        student_unmatched_probs = student_aligned[:, student_unmatched_mask]  # [seq_len, num_student_unmatched]
-
         unmatched_loss = torch.tensor(0.0, device=device)
-        if teacher_unmatched_probs.size(-1) > 0 and student_unmatched_probs.size(-1) > 0:
-            # Sort unmatched probabilities
-            teacher_unmatched_sorted = teacher_unmatched_probs.sort(dim=-1, descending=True).values
-            student_unmatched_sorted = student_unmatched_probs.sort(dim=-1, descending=True).values
 
-            # Pad to same size if needed
-            teacher_unmatched_size = teacher_unmatched_sorted.size(-1)
-            student_unmatched_size = student_unmatched_sorted.size(-1)
-            max_unmatched_size = max(teacher_unmatched_size, student_unmatched_size)
+        # Skip unmatched computation entirely when weight is 0
+        if self.hybrid_unmatched_weight is None or self.hybrid_unmatched_weight != 0.0:
+            teacher_unmatched_mask = ~teacher_matched_mask
+            student_unmatched_mask = ~student_matched_mask
 
-            if teacher_unmatched_size < max_unmatched_size:
-                teacher_unmatched_sorted = F.pad(
-                    teacher_unmatched_sorted, (0, max_unmatched_size - teacher_unmatched_size)
-                )
-            if student_unmatched_size < max_unmatched_size:
-                student_unmatched_sorted = F.pad(
-                    student_unmatched_sorted, (0, max_unmatched_size - student_unmatched_size)
-                )
+            teacher_unmatched_probs = teacher_aligned[:, teacher_unmatched_mask]  # [seq_len, num_teacher_unmatched]
+            student_unmatched_probs = student_aligned[:, student_unmatched_mask]  # [seq_len, num_student_unmatched]
 
-            # L1 loss on sorted unmatched tokens
-            unmatched_loss = F.l1_loss(student_unmatched_sorted, teacher_unmatched_sorted, reduction="sum")
-            unmatched_loss /= student_aligned.size(0)  # Normalize by sequence length
+            if teacher_unmatched_probs.size(-1) > 0 and student_unmatched_probs.size(-1) > 0:
+                # Sort unmatched probabilities
+                teacher_unmatched_sorted = teacher_unmatched_probs.sort(dim=-1, descending=True).values
+                student_unmatched_sorted = student_unmatched_probs.sort(dim=-1, descending=True).values
+
+                # Pad to same size if needed
+                teacher_unmatched_size = teacher_unmatched_sorted.size(-1)
+                student_unmatched_size = student_unmatched_sorted.size(-1)
+                max_unmatched_size = max(teacher_unmatched_size, student_unmatched_size)
+
+                if teacher_unmatched_size < max_unmatched_size:
+                    teacher_unmatched_sorted = F.pad(
+                        teacher_unmatched_sorted, (0, max_unmatched_size - teacher_unmatched_size)
+                    )
+                if student_unmatched_size < max_unmatched_size:
+                    student_unmatched_sorted = F.pad(
+                        student_unmatched_sorted, (0, max_unmatched_size - student_unmatched_size)
+                    )
+
+                # L1 loss on sorted unmatched tokens
+                unmatched_loss = F.l1_loss(student_unmatched_sorted, teacher_unmatched_sorted, reduction="sum")
+                unmatched_loss /= student_aligned.size(0)  # Normalize by sequence length
 
         # 3. Combine losses with weights
         if self.hybrid_matched_weight is None:
@@ -972,8 +1041,6 @@ class GOLDTrainer(SFTTrainer):
             "messages",
             "chat_template_kwargs",
             "tools",
-            "original_prompt_text",
-            "original_completion_text",
         ]
         if self._signature_columns is None:
             self._signature_columns = required_columns
@@ -1048,51 +1115,6 @@ class GOLDTrainer(SFTTrainer):
         self._step += 1
         return inputs
 
-    def _decode_completion_texts_from_labels(self, slice_inputs: dict[str, torch.Tensor | Any]) -> list[str] | None:
-        """Decode completion text from labels when raw text is absent."""
-        labels = slice_inputs.get("labels")
-        if labels is None or not isinstance(labels, torch.Tensor):
-            return None
-
-        labels_cpu = labels.detach().cpu()
-        decoded_completion_tokens: list[list[int]] = []
-        for row in labels_cpu:
-            token_ids = row[row != -100].tolist()
-            if self.processing_class.pad_token_id is not None:
-                token_ids = [tok for tok in token_ids if tok != self.processing_class.pad_token_id]
-            decoded_completion_tokens.append(token_ids)
-
-        return self.processing_class.batch_decode(
-            decoded_completion_tokens,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-
-    def _ensure_original_text_fields(
-        self, slice_inputs: dict[str, torch.Tensor | Any]
-    ) -> dict[str, torch.Tensor | Any]:
-        """Populate original prompt/completion text fields when missing."""
-        if "original_prompt_text" in slice_inputs and "original_completion_text" in slice_inputs:
-            return slice_inputs
-
-        prompts = slice_inputs.get("prompts")
-        if prompts is None or not isinstance(prompts, torch.Tensor):
-            return slice_inputs
-
-        prompt_texts = self.processing_class.batch_decode(
-            prompts,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        completion_texts = self._decode_completion_texts_from_labels(slice_inputs)
-        if completion_texts is None:
-            return slice_inputs
-
-        updated_slice = dict(slice_inputs)
-        updated_slice["original_prompt_text"] = prompt_texts
-        updated_slice["original_completion_text"] = completion_texts
-        return updated_slice
-
     @staticmethod
     def _build_sequence_batch(
         new_input_ids: torch.Tensor,
@@ -1140,15 +1162,6 @@ class GOLDTrainer(SFTTrainer):
         for i, flag in enumerate(on_policy_flags):
             if not flag:
                 slice_inputs = slices[i]
-
-                if self.use_uld_loss and self.teacher_tokenizer is not None:
-                    slice_inputs = self._ensure_original_text_fields(slice_inputs)
-                    if "original_prompt_text" not in slice_inputs or "original_completion_text" not in slice_inputs:
-                        raise ValueError(
-                            "Off-policy batch missing 'original_prompt_text' or 'original_completion_text' fields. "
-                            "When using ULD loss with cross-tokenizer alignment, datasets must be prepared with "
-                            "_prepare_dataset_with_original_text(). Ensure your dataset includes these fields."
-                        )
 
                 self._buffered_inputs[i] = slice_inputs
 
@@ -1228,8 +1241,15 @@ class GOLDTrainer(SFTTrainer):
                 updated_slice["input_ids"] = new_input_ids
                 updated_slice["attention_mask"] = new_attention_mask
                 updated_slice["labels"] = new_labels
-                updated_slice["original_prompt_text"] = prompt_texts
-                updated_slice["original_completion_text"] = completion_texts
+
+                # Update messages with generated completions (shallow copy to preserve originals)
+                if "messages" in slice_inputs:
+                    updated_messages = []
+                    for i, msgs in enumerate(slice_inputs["messages"]):
+                        msgs_copy = list(msgs)
+                        msgs_copy[-1] = {"role": "assistant", "content": completion_texts[i]}
+                        updated_messages.append(msgs_copy)
+                    updated_slice["messages"] = updated_messages
 
                 self._buffered_inputs[slice_idx] = updated_slice
                 self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
@@ -1351,8 +1371,15 @@ class GOLDTrainer(SFTTrainer):
             updated_slice["input_ids"] = new_input_ids
             updated_slice["attention_mask"] = new_attention_mask
             updated_slice["labels"] = new_labels
-            updated_slice["original_prompt_text"] = prompt_txts_with_special
-            updated_slice["original_completion_text"] = completion_texts
+
+            # Update messages with generated completions (shallow copy to preserve originals)
+            if "messages" in slice_inputs:
+                updated_messages = []
+                for i, msgs in enumerate(slice_inputs["messages"]):
+                    msgs_copy = list(msgs)
+                    msgs_copy[-1] = {"role": "assistant", "content": completion_texts[i]}
+                    updated_messages.append(msgs_copy)
+                updated_slice["messages"] = updated_messages
 
             self._buffered_inputs[slice_idx] = updated_slice
             self._buffered_text_logs[slice_idx] = (prompt_txts, completion_texts)
@@ -1444,10 +1471,6 @@ class GOLDTrainer(SFTTrainer):
                 result = {}
 
                 if "prompt" in example:  # prompt-completion case
-                    # Store original text
-                    result["original_prompt_text"] = example["prompt"]
-                    result["original_completion_text"] = example["completion"]
-
                     if is_conversational(example):
                         prompt_ids = processing_class.apply_chat_template(
                             example["prompt"], return_dict=False, **example.get("chat_template_kwargs", {})
@@ -1521,17 +1544,11 @@ class GOLDTrainer(SFTTrainer):
                                     else assistant_content
                                 )
 
-                            # Store original text for cross-tokenizer distillation
-                            result["original_prompt_text"] = prompt_text
-                            result["original_completion_text"] = completion_text
                         else:
                             # Fallback: use empty prompt and full text as completion
                             full_text = processing_class.apply_chat_template(
                                 messages, tokenize=False, **example.get("chat_template_kwargs", {})
                             )
-                            result["original_prompt_text"] = ""
-                            result["original_completion_text"] = full_text
-
                         # Process the conversation normally
                         processed = processing_class.apply_chat_template(
                             example["messages"],
@@ -1552,10 +1569,6 @@ class GOLDTrainer(SFTTrainer):
                         if "attention_mask" not in result:
                             result["attention_mask"] = [1] * len(result["input_ids"])
                     else:
-                        # For regular language modeling, store the full text as completion and empty prompt
-                        result["original_prompt_text"] = ""
-                        result["original_completion_text"] = example.get(dataset_text_field, example.get("text", ""))
-
                         tokenized = processing_class(text=example[dataset_text_field])
                         result.update(
                             {
@@ -1583,7 +1596,7 @@ class GOLDTrainer(SFTTrainer):
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Packing {dataset_name} dataset"
 
-                columns_to_keep = ["input_ids", "original_prompt_text", "original_completion_text"]
+                columns_to_keep = ["input_ids"]
                 existing_columns = set(dataset.column_names)
                 columns_to_select = [col for col in columns_to_keep if col in existing_columns]
 
@@ -1602,8 +1615,6 @@ class GOLDTrainer(SFTTrainer):
                     "completion_mask",
                     "messages",
                     "assistant_masks",
-                    "original_prompt_text",
-                    "original_completion_text",
                 }
                 dataset = dataset.select_columns(required_columns.intersection(dataset.column_names))
 
@@ -1691,33 +1702,37 @@ class GOLDTrainer(SFTTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.use_uld_loss and self.teacher_tokenizer is not None:
-            if "original_prompt_text" in inputs and "original_completion_text" in inputs:
-                prompt_texts = inputs["original_prompt_text"]
-                completion_texts = inputs["original_completion_text"]
-                full_texts = [p + c for p, c in zip(prompt_texts, completion_texts, strict=True)]
+            if "messages" in inputs:
+                (
+                    teacher_input_ids,
+                    teacher_labels,
+                    teacher_attention_mask,
+                    teacher_prompt_length,
+                ) = build_teacher_inputs_from_messages(
+                    self.teacher_tokenizer,
+                    inputs["messages"],
+                )
             else:
-                # Fallback: decode student input_ids (current approach)
-                # WARNING: This may not work perfectly for cross-tokenizer distillation
+                # Fallback: decode student input_ids
                 full_sequences = inputs["input_ids"]
                 full_texts = self.processing_class.batch_decode(full_sequences, skip_special_tokens=False)
 
-                # Try to split prompt/completion using original prompt length
                 prompt_lengths = inputs["prompts"].shape[1]
                 prompt_texts = self.processing_class.batch_decode(inputs["prompts"], skip_special_tokens=False)
                 completion_texts = [
                     full.replace(prompt, "", 1) for full, prompt in zip(full_texts, prompt_texts, strict=True)
                 ]
 
-            (
-                teacher_input_ids,
-                teacher_labels,
-                teacher_attention_mask,
-                teacher_prompt_length,
-            ) = build_teacher_inputs_from_texts(
-                self.teacher_tokenizer,
-                prompt_texts,
-                completion_texts,
-            )
+                (
+                    teacher_input_ids,
+                    teacher_labels,
+                    teacher_attention_mask,
+                    teacher_prompt_length,
+                ) = build_teacher_inputs_from_texts(
+                    self.teacher_tokenizer,
+                    prompt_texts,
+                    completion_texts,
+                )
 
             teacher_input_ids = teacher_input_ids.to(self.accelerator.device)
             teacher_labels = teacher_labels.to(self.accelerator.device)
