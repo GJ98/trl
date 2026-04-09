@@ -244,7 +244,7 @@ def build_teacher_inputs_from_messages(
         # Build full text from all messages
         full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, enable_thinking=False)
         # Extract completion as the suffix after the prompt; strip trailing \n added by chat template
-        completion_text = full_text[len(prompt_text):].rstrip("\n")
+        completion_text = full_text[len(prompt_text):]
 
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         completion_ids = tokenizer(completion_text, add_special_tokens=False)["input_ids"]
@@ -374,10 +374,9 @@ class ULDLoss(nn.Module):
         for token_str, teacher_id in teacher_vocab.items():
             if token_str in student_token_to_id:
                 student_id = student_token_to_id[token_str]
-                if teacher_id == student_id:
-                    vocab_mapping[teacher_id] = student_id
-                    teacher_matched_ids.add(teacher_id)
-                    student_matched_ids.add(student_id)
+                vocab_mapping[teacher_id] = student_id
+                teacher_matched_ids.add(teacher_id)
+                student_matched_ids.add(student_id)
 
         self._vocab_mapping = vocab_mapping
         self._teacher_matched_ids = teacher_matched_ids
@@ -437,12 +436,39 @@ class ULDLoss(nn.Module):
                 continue
 
             # Extract answer logits
-            student_answer_logits = student_logits[i, student_start : student_start + student_size]
-            teacher_answer_logits = teacher_logits[i, teacher_start : teacher_start + teacher_size]
+            # [Before] logits[start:start+size] — logits[start] predicts input_ids[start+1], not input_ids[start]
+            #   → misaligned with token_ids[start:start+size] which are input_ids[start:start+size]
+            # student_answer_logits = student_logits[i, student_start : student_start + student_size]
+            # teacher_answer_logits = teacher_logits[i, teacher_start : teacher_start + teacher_size]
+            # [After] Autoregressive shift fix: logits[start-1] predicts input_ids[start], aligning with token_ids
+            student_answer_logits = student_logits[i, student_start - 1 : student_start - 1 + student_size]
+            teacher_answer_logits = teacher_logits[i, teacher_start - 1 : teacher_start - 1 + teacher_size]
 
-            # Convert to probabilities
-            student_probs = F.softmax(student_answer_logits / self.student_temperature, dim=-1)
-            teacher_probs = F.softmax(teacher_answer_logits / self.teacher_temperature, dim=-1)
+            # DEBUG: raw logits before softmax
+            print(f"[DEBUG logits] student_answer_logits shape: {student_answer_logits.shape}, dtype: {student_answer_logits.dtype}")
+            print(f"[DEBUG logits] teacher_answer_logits shape: {teacher_answer_logits.shape}, dtype: {teacher_answer_logits.dtype}")
+            print(f"[DEBUG logits] student_answer_logits max: {student_answer_logits.max().item():.4f}, min: {student_answer_logits.min().item():.4f}, std: {student_answer_logits.std().item():.4f}, mean: {student_answer_logits.mean().item():.4f}")
+            print(f"[DEBUG logits] teacher_answer_logits max: {teacher_answer_logits.max().item():.4f}, min: {teacher_answer_logits.min().item():.4f}, std: {teacher_answer_logits.std().item():.4f}, mean: {teacher_answer_logits.mean().item():.4f}")
+            # per-position stats
+            t_per_pos_std = teacher_answer_logits.float().std(dim=-1)
+            s_per_pos_std = student_answer_logits.float().std(dim=-1)
+            print(f"[DEBUG logits] teacher per-pos std: mean={t_per_pos_std.mean().item():.4f}, min={t_per_pos_std.min().item():.4f}, max={t_per_pos_std.max().item():.4f}")
+            print(f"[DEBUG logits] student per-pos std: mean={s_per_pos_std.mean().item():.4f}, min={s_per_pos_std.min().item():.4f}, max={s_per_pos_std.max().item():.4f}")
+            # top1 - top2 gap
+            t_topk = teacher_answer_logits.float().topk(2, dim=-1)
+            t_gap = (t_topk.values[:, 0] - t_topk.values[:, 1])
+            print(f"[DEBUG logits] teacher top1-top2 gap: mean={t_gap.mean().item():.4f}, min={t_gap.min().item():.4f}, max={t_gap.max().item():.4f}")
+            # top1, top2 token ids at first 5 positions
+            for pos in range(min(5, teacher_answer_logits.size(0))):
+                top2_vals = t_topk.values[pos]
+                top2_ids = t_topk.indices[pos]
+                print(f"[DEBUG logits] teacher pos={pos}: top1 id={top2_ids[0].item()} val={top2_vals[0].item():.4f}, top2 id={top2_ids[1].item()} val={top2_vals[1].item():.4f}")
+
+            # Convert to probabilities (compute in fp32 to avoid bf16 saturation)
+            student_probs = F.softmax(student_answer_logits.float() / self.student_temperature, dim=-1)
+            teacher_probs = F.softmax(teacher_answer_logits.float() / self.teacher_temperature, dim=-1)
+
+            # probs는 step_1.pt의 logits에서 계산 가능
 
             # Get token IDs for mapping (always use actual input_ids)
             student_token_ids = student_input_ids[i, student_start : student_start + student_size].tolist()
@@ -469,8 +495,14 @@ class ULDLoss(nn.Module):
                 print(f"[DEBUG align] student first 10 pieces: {s_pcs}")
                 print(f"[DEBUG align] teacher first 10 pieces: {t_pcs}")
 
-                # DEBUG: pre-alignment lengths
+                # DEBUG: pre-alignment lengths and max probs
                 print(f"[DEBUG pre-align] student_probs len: {student_probs.size(0)}, teacher_probs len: {teacher_probs.size(0)}")
+                print(f"[DEBUG pre-align] teacher_probs max: {teacher_probs.max().item():.8f}, teacher_probs sum(dim=-1) first 3: {teacher_probs.sum(dim=-1)[:3].tolist()}")
+                print(f"[DEBUG pre-align] student_probs max: {student_probs.max().item():.8f}, student_probs sum(dim=-1) first 3: {student_probs.sum(dim=-1)[:3].tolist()}")
+                # multi-token group 개수
+                s_multi = sum(1 for g in student_alignment_groups if len(g) > 1)
+                t_multi = sum(1 for g in teacher_alignment_groups if len(g) > 1)
+                print(f"[DEBUG align-groups] student: {len(student_alignment_groups)} groups ({s_multi} multi-token), teacher: {len(teacher_alignment_groups)} groups ({t_multi} multi-token)")
 
                 # Merge student probabilities using student alignment groups
                 # Pass student_token_ids to enable corrected conditional probability merging
@@ -483,6 +515,13 @@ class ULDLoss(nn.Module):
                 teacher_aligned = self._merge_probabilities_with_alignment_groups(
                     teacher_probs, teacher_alignment_groups, teacher_token_ids
                 )
+                # DEBUG: post-alignment
+                print(f"[DEBUG post-align] teacher_aligned max: {teacher_aligned.max().item():.8f}, shape: {teacher_aligned.shape}")
+                print(f"[DEBUG post-align] student_aligned max: {student_aligned.max().item():.8f}, shape: {student_aligned.shape}")
+                # 가장 높은 확률 위치 확인
+                t_max_val, t_max_flat = teacher_aligned.flatten().topk(3)
+                t_max_pos = [(idx.item() // teacher_aligned.size(1), idx.item() % teacher_aligned.size(1)) for idx in t_max_flat]
+                print(f"[DEBUG post-align] teacher top3: vals={t_max_val.tolist()}, positions={t_max_pos}")
             else:
                 min_length = min(len(student_token_ids), len(teacher_token_ids))
                 student_aligned = student_probs[:min_length, :]
@@ -925,7 +964,26 @@ class GOLDTrainer(SFTTrainer):
                 init_kwargs.setdefault("revision", args.teacher_model_revision)
             if "torch_dtype" in init_kwargs and "dtype" not in init_kwargs:
                 init_kwargs["dtype"] = init_kwargs.pop("torch_dtype")
-            teacher_model = create_model_from_path(teacher_model, **init_kwargs)
+            # Disable ZeRO-3 auto-init during teacher loading to prevent parameter
+            # sharding in from_pretrained. The teacher will be initialized with
+            # stage=0 via deepspeed.initialize later.
+            from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+            if is_deepspeed_zero3_enabled():
+                import transformers.integrations.deepspeed as _ds_integration
+                _saved_ref = _ds_integration._hf_deepspeed_config_weak_ref
+                _ds_integration._hf_deepspeed_config_weak_ref = None
+                try:
+                    teacher_model = create_model_from_path(teacher_model, **init_kwargs)
+                finally:
+                    _ds_integration._hf_deepspeed_config_weak_ref = _saved_ref
+            else:
+                teacher_model = create_model_from_path(teacher_model, **init_kwargs)
+        # Softcapping 유지 (gemma-4 기본값 30.0)
+        # 비활성화하면 teacher logit max ~72.5로 near-one-hot 분포가 되어
+        # student가 매칭하기 어렵고 gradient가 불안정해짐
+        # tc = getattr(teacher_model.config, 'text_config', teacher_model.config)
+        # if getattr(tc, 'final_logit_softcapping', None) is not None:
+        #     tc.final_logit_softcapping = None
         self.use_uld_loss = args.use_uld_loss
         self.teacher_tokenizer = None
         if args.use_uld_loss and args.teacher_tokenizer_name_or_path is not None:
@@ -954,10 +1012,28 @@ class GOLDTrainer(SFTTrainer):
         if not args.use_uld_loss:
             teacher_model.resize_token_embeddings(self.model.config.vocab_size)
 
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-        else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+        # --- 기존: DeepSpeed stage=0 wrapping ---
+        # if self.is_deepspeed_enabled:
+        #     # ZeRO-3 parameter sharding corrupts teacher logits for complex architectures
+        #     # (e.g. Gemma-4's multimodal 3-layer nesting causes incomplete parameter gather,
+        #     # resulting in exploded logits and 0% top-1 token match vs single GPU).
+        #     # Force stage=0 (no sharding) for the teacher while keeping ZeRO-3 for the student.
+        #     import deepspeed
+        #     from copy import deepcopy
+        #
+        #     config_kwargs = deepcopy(self.accelerator.state.deepspeed_plugin.deepspeed_config)
+        #     config_kwargs["zero_optimization"]["stage"] = 0
+        #     teacher_model, *_ = deepspeed.initialize(model=teacher_model, config=config_kwargs)
+        #     teacher_model.eval()
+        #     self.teacher_model = teacher_model
+        # else:
+        #     self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+        # self.teacher_model.requires_grad_(False)
+
+        # --- 신규: CPU offload (pinned memory + layer-by-layer forward) ---
+        from trl.experimental.gold.teacher_offload import prepare_teacher_offload
+        prepare_teacher_offload(teacher_model)
+        self.teacher_model = teacher_model
 
         self.lmbda = args.lmbda
         self.beta = args.beta
@@ -1273,6 +1349,11 @@ class GOLDTrainer(SFTTrainer):
                 updated_slice["input_ids"] = new_input_ids
                 updated_slice["attention_mask"] = new_attention_mask
                 updated_slice["labels"] = new_labels
+                # Bug #1 fix: generate_on_policy_outputs uses inputs["prompts"] directly for
+                # model.generate, so the original prompts tensor is still valid here. We must
+                # explicitly carry it over to prevent stale prompts from the split batch.
+                updated_slice["prompts"] = slice_inputs["prompts"]
+                updated_slice["prompt_attention_mask"] = slice_inputs.get("prompt_attention_mask")
 
                 # Update messages with generated completions (shallow copy to preserve originals)
                 if "messages" in slice_inputs:
@@ -1403,6 +1484,11 @@ class GOLDTrainer(SFTTrainer):
             updated_slice["input_ids"] = new_input_ids
             updated_slice["attention_mask"] = new_attention_mask
             updated_slice["labels"] = new_labels
+            # Bug #1 fix: prompts and prompt_attention_mask must be updated to match the
+            # re-padded on-policy sequences. Without this, prompts.shape[1] retains the
+            # original batch's P_max, causing shape mismatch in compute_loss.
+            updated_slice["prompts"] = prompt_ids
+            updated_slice["prompt_attention_mask"] = prompt_attention_mask
 
             # Update messages with generated completions (shallow copy to preserve originals)
             if "messages" in slice_inputs:
@@ -1775,6 +1861,19 @@ class GOLDTrainer(SFTTrainer):
             teacher_labels = teacher_labels.to(self.accelerator.device)
             teacher_attention_mask = teacher_attention_mask.to(self.accelerator.device)
 
+            # DEBUG: student vs teacher input 비교
+            if self.accelerator.is_main_process and self._step < 2:
+                for bi in range(inputs["input_ids"].size(0)):
+                    s_ids = inputs["input_ids"][bi]
+                    t_ids = teacher_input_ids[bi]
+                    s_real = s_ids[s_ids != self.processing_class.pad_token_id]
+                    t_real = t_ids[t_ids != self.teacher_tokenizer.pad_token_id]
+                    print(f"[DEBUG seq b={bi}] student real len={len(s_real)}, teacher real len={len(t_real)}")
+                    print(f"[DEBUG seq b={bi}] student first 30: {repr(self.processing_class.decode(s_real[:30]))}")
+                    print(f"[DEBUG seq b={bi}] teacher first 30: {repr(self.teacher_tokenizer.decode(t_real[:30]))}")
+                    print(f"[DEBUG seq b={bi}] student last 30: {repr(self.processing_class.decode(s_real[-30:]))}")
+                    print(f"[DEBUG seq b={bi}] teacher last 30: {repr(self.teacher_tokenizer.decode(t_real[-30:]))}")
+
             outputs_student = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
@@ -1782,11 +1881,71 @@ class GOLDTrainer(SFTTrainer):
             )
 
             self.teacher_model.eval()
+
+            # # DEBUG: 각 layer activation 캡처
+            # _activations = {}
+            # _hooks = []
+            # if self.accelerator.is_main_process and self._step < 2:
+            #     inner = getattr(self.teacher_model, 'module', self.teacher_model)
+            #     text_model = getattr(inner, 'model', inner)
+            #     text_model = getattr(text_model, 'language_model', getattr(text_model, 'text_model', text_model))
+            #     def make_hook(name):
+            #         def hook(module, input, output):
+            #             out = output[0] if isinstance(output, tuple) else output
+            #             _activations[name] = out.detach().cpu()
+            #         return hook
+            #     embed = getattr(text_model, 'embed_tokens', None)
+            #     if embed: _hooks.append(embed.register_forward_hook(make_hook("embed")))
+            #     for i, layer in enumerate(getattr(text_model, 'layers', [])):
+            #         _hooks.append(layer.register_forward_hook(make_hook(f"layer_{i}")))
+            #     norm = getattr(text_model, 'norm', None)
+            #     if norm: _hooks.append(norm.register_forward_hook(make_hook("final_norm")))
+            #     lm_head = getattr(inner, 'lm_head', None)
+            #     if lm_head: _hooks.append(lm_head.register_forward_hook(make_hook("lm_head")))
+
+            # --- 기존: GPU 상주 teacher forward ---
+            # with torch.no_grad():
+            #     outputs_teacher = self.teacher_model(
+            #         input_ids=teacher_input_ids,
+            #         attention_mask=teacher_attention_mask,
+            #         use_cache=True,
+            #     )
+
+            # --- 신규: CPU offload teacher forward ---
+            from trl.experimental.gold.teacher_offload import teacher_forward_offload
             with torch.no_grad():
-                outputs_teacher = self.teacher_model(
-                    input_ids=teacher_input_ids,
+                teacher_logits = teacher_forward_offload(
+                    self.teacher_model, teacher_input_ids,
                     attention_mask=teacher_attention_mask,
+                    device=self.accelerator.device,
                 )
+            # outputs_teacher.logits 대신 teacher_logits를 직접 사용하도록 래핑
+            from types import SimpleNamespace
+            outputs_teacher = SimpleNamespace(logits=teacher_logits)
+
+            # for h in _hooks:
+            #     h.remove()
+            # if _activations:
+            #     import os
+            #     os.makedirs("/workspace/distill-test/debug_tensors", exist_ok=True)
+            #     torch.save(_activations, "/workspace/distill-test/debug_tensors/teacher_activations.pt")
+            #     print(f"[DEBUG] Saved {len(_activations)} activations: {list(_activations.keys())[:5]}...")
+
+            # # DEBUG: save logits for analysis
+            # if self.accelerator.is_main_process and self._step < 2:
+            #     import os
+            #     os.makedirs("/workspace/distill-test/debug_tensors", exist_ok=True)
+            #     torch.save({
+            #         "student_logits": outputs_student.logits.cpu(),
+            #         "teacher_logits": outputs_teacher.logits.cpu(),
+            #         "student_input_ids": inputs["input_ids"].cpu(),
+            #         "teacher_input_ids": teacher_input_ids.cpu(),
+            #         "student_labels": inputs["labels"].cpu(),
+            #         "teacher_labels": teacher_labels.cpu(),
+            #         "student_attention_mask": inputs["attention_mask"].cpu(),
+            #         "teacher_attention_mask": teacher_attention_mask.cpu(),
+            #     }, f"/workspace/distill-test/debug_tensors/step_{self._step}.pt")
+            #     print(f"[DEBUG] Saved tensors to /workspace/distill-test/debug_tensors/step_{self._step}.pt")
 
             # These are not used for ULD loss but are needed if JSD loss were to be used in this branch
             student_prompt_length = inputs["prompts"].shape[1]
@@ -1859,12 +2018,24 @@ class GOLDTrainer(SFTTrainer):
                     attention_mask=inputs["attention_mask"],
                 )
 
-                self.teacher_model.eval()
+                # --- 기존: GPU 상주 teacher forward ---
+                # self.teacher_model.eval()
+                # with torch.no_grad():
+                #     outputs_teacher = self.teacher_model(
+                #         input_ids=inputs["input_ids"],
+                #         attention_mask=inputs["attention_mask"],
+                #     )
+
+                # --- 신규: CPU offload teacher forward ---
+                from trl.experimental.gold.teacher_offload import teacher_forward_offload
                 with torch.no_grad():
-                    outputs_teacher = self.teacher_model(
-                        input_ids=inputs["input_ids"],
+                    teacher_logits = teacher_forward_offload(
+                        self.teacher_model, inputs["input_ids"],
                         attention_mask=inputs["attention_mask"],
+                        device=self.accelerator.device,
                     )
+                from types import SimpleNamespace
+                outputs_teacher = SimpleNamespace(logits=teacher_logits)
 
                 prompt_lengths = inputs["prompts"].shape[1]
                 shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
@@ -1895,18 +2066,18 @@ class GOLDTrainer(SFTTrainer):
             ):
                 teacher_labels[teacher_labels == self.teacher_tokenizer.pad_token_id] = -100
 
-            # DEBUG: save input_ids and labels to file
-            if self.accelerator.is_main_process:
-                import os
-                debug_dir = "/workspace/distill-test/debug_tensors"
-                os.makedirs(debug_dir, exist_ok=True)
-                torch.save({
-                    "student_input_ids": student_input_ids.cpu(),
-                    "teacher_input_ids": teacher_input_ids_for_loss.cpu(),
-                    "student_labels": student_labels.cpu(),
-                    "teacher_labels": teacher_labels_for_loss.cpu(),
-                }, f"{debug_dir}/step_{self._step}.pt")
-                print(f"[DEBUG] Saved tensors to {debug_dir}/step_{self._step}.pt")
+            # # DEBUG: save input_ids and labels to file
+            # if self.accelerator.is_main_process:
+            #     import os
+            #     debug_dir = "/workspace/distill-test/debug_tensors"
+            #     os.makedirs(debug_dir, exist_ok=True)
+            #     torch.save({
+            #         "student_input_ids": student_input_ids.cpu(),
+            #         "teacher_input_ids": teacher_input_ids_for_loss.cpu(),
+            #         "student_labels": student_labels.cpu(),
+            #         "teacher_labels": teacher_labels_for_loss.cpu(),
+            #     }, f"{debug_dir}/step_{self._step}.pt")
+            #     print(f"[DEBUG] Saved tensors to {debug_dir}/step_{self._step}.pt")
 
             # DEBUG: trace zero-loss issue
             if self.accelerator.is_main_process and self._step < 3:
@@ -2050,14 +2221,21 @@ class GOLDTrainer(SFTTrainer):
         import deepspeed
 
         unwrapped_student = self.accelerator.unwrap_model(model)
-        unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
         student_head = unwrapped_student.get_output_embeddings()
-        teacher_head = unwrapped_teacher.get_output_embeddings()
-        params = [student_head.weight, teacher_head.weight]
+        params = [student_head.weight]
         if student_head.bias is not None:
             params.append(student_head.bias)
-        if teacher_head.bias is not None:
-            params.append(teacher_head.bias)
+
+        # Teacher uses stage=0 (no sharding), so its parameters are already fully
+        # materialized and must NOT be passed to GatheredParameters.
+        unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
+        teacher_head = unwrapped_teacher.get_output_embeddings()
+        if hasattr(teacher_head.weight, "ds_id"):
+            # Teacher is ZeRO-3 partitioned (unexpected but safe to handle)
+            params.append(teacher_head.weight)
+            if teacher_head.bias is not None:
+                params.append(teacher_head.bias)
+
         return deepspeed.zero.GatheredParameters(params, modifier_rank=None)
 
     @profiling_decorator
