@@ -464,9 +464,9 @@ class ULDLoss(nn.Module):
                 top2_ids = t_topk.indices[pos]
                 print(f"[DEBUG logits] teacher pos={pos}: top1 id={top2_ids[0].item()} val={top2_vals[0].item():.4f}, top2 id={top2_ids[1].item()} val={top2_vals[1].item():.4f}")
 
-            # Convert to probabilities (compute in fp32 to avoid bf16 saturation)
-            student_probs = F.softmax(student_answer_logits.float() / self.student_temperature, dim=-1)
-            teacher_probs = F.softmax(teacher_answer_logits.float() / self.teacher_temperature, dim=-1)
+            # Convert to probabilities
+            student_probs = F.softmax(student_answer_logits / self.student_temperature, dim=-1)
+            teacher_probs = F.softmax(teacher_answer_logits / self.teacher_temperature, dim=-1)
 
             # probs는 step_1.pt의 logits에서 계산 가능
 
